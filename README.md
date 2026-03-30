@@ -430,7 +430,8 @@ MiniStack keeps Python Lambda functions warm between invocations. After the firs
                     │  │  Step Functions  API GW v1/v2    │    │
                     │  │  ECS   RDS   ElastiCache  Glue   │    │
                     │  │  Athena  Firehose  Route53        │    │
-                    │  │  Cognito  EC2                    │    │
+                    │  │  Cognito  EC2  EMR  EBS  EFS     │    │
+                    │  │  ALB/ELBv2                       │    │
                     │  └──────────────────────────────────┘    │
                     │                                          │
                     │  In-Memory Storage + Optional Docker     │
@@ -453,19 +454,19 @@ pip install boto3 pytest duckdb docker cbor2
 # Start MiniStack
 docker compose up -d
 
-# Run the full test suite (644 tests across all 26 services)
+# Run the full test suite (694 tests across all 30 services)
 pytest tests/ -v
 ```
 
 Expected output:
 ```
-collected 644 items
+collected 694 items
 
 tests/test_services.py::test_s3_create_bucket PASSED
 ...
 tests/test_services.py::test_app_asgi_callable PASSED
 
-644 passed in ~60s
+694 passed in ~60s
 ```
 
 ---
