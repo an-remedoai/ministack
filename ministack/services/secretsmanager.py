@@ -11,9 +11,9 @@ Supports: CreateSecret, GetSecretValue, ListSecrets, DeleteSecret,
 
 import base64
 import copy
-import os
 import json
 import logging
+import os
 import secrets as stdlib_secrets
 import string
 import time
@@ -25,7 +25,7 @@ logger = logging.getLogger("secretsmanager")
 ACCOUNT_ID = "000000000000"
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
-from ministack.core.persistence import load_state, PERSIST_STATE
+from ministack.core.persistence import PERSIST_STATE, load_state
 
 _secrets: dict = {}
 _resource_policies: dict = {}
@@ -369,8 +369,10 @@ def _delete_secret(data):
         del _secrets[key]
         return json_response({"ARN": arn, "Name": sname, "DeletionDate": deletion_date})
 
-    secret["DeletedDate"] = deletion_date
-    return json_response({"ARN": secret["ARN"], "Name": secret["Name"], "DeletionDate": deletion_date})
+    # In the emulator, remove immediately instead of waiting for the recovery window
+    arn, sname = secret["ARN"], secret["Name"]
+    del _secrets[key]
+    return json_response({"ARN": arn, "Name": sname, "DeletionDate": deletion_date})
 
 
 def _restore_secret(data):

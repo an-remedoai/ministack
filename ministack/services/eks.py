@@ -15,15 +15,19 @@ import copy
 import json
 import logging
 import os
-import re
+import time
 
 from ministack.core.persistence import load_state
 from ministack.core.responses import (
     error_response_json,
     json_response,
     new_uuid,
-    now_iso,
 )
+
+
+def _now_epoch():
+    """Return current time as epoch float — Terraform expects JSON Number timestamps."""
+    return time.time()
 
 logger = logging.getLogger("eks")
 
@@ -92,7 +96,7 @@ def _make_update(update_type, params=None):
         "status": "Successful",
         "type": update_type,
         "params": params or [],
-        "createdAt": now_iso(),
+        "createdAt": _now_epoch(),
         "errors": [],
     }
     _updates[uid] = update
@@ -130,7 +134,7 @@ def _create_cluster(data):
     tags = data.get("tags", {})
 
     arn = _cluster_arn(name)
-    now = now_iso()
+    now = _now_epoch()
     oidc = _oidc_issuer(name)
     endpoint = _endpoint(name)
     ca = _certificate_authority()
@@ -272,7 +276,7 @@ def _create_nodegroup(cluster_name, data):
         return error_response_json("ResourceInUseException", f"Nodegroup already exists with name: {ng_name}", 409)
 
     arn = _nodegroup_arn(cluster_name, ng_name)
-    now = now_iso()
+    now = _now_epoch()
     tags = data.get("tags", {})
 
     scaling = data.get("scalingConfig", {})
@@ -395,7 +399,7 @@ def _update_nodegroup_config(cluster_name, ng_name, data):
         for t in remove_taints:
             ng["taints"] = [x for x in ng["taints"] if x.get("key") != t.get("key")]
 
-    ng["modifiedAt"] = now_iso()
+    ng["modifiedAt"] = _now_epoch()
     update = _make_update("ConfigUpdate", params)
     return json_response({"update": update}, 200)
 
@@ -423,7 +427,7 @@ def _create_addon(cluster_name, data):
         return error_response_json("ResourceInUseException", f"Addon already exists: {addon_name}", 409)
 
     arn = _addon_arn(cluster_name, addon_name)
-    now = now_iso()
+    now = _now_epoch()
     tags = data.get("tags", {})
 
     default = _DEFAULT_ADDONS.get(addon_name, {})
@@ -512,7 +516,7 @@ def _create_fargate_profile(cluster_name, data):
         return error_response_json("ResourceInUseException", f"Fargate profile already exists: {fp_name}", 409)
 
     arn = _fargate_arn(cluster_name, fp_name)
-    now = now_iso()
+    now = _now_epoch()
     tags = data.get("tags", {})
 
     profile = {

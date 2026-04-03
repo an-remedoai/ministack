@@ -1012,6 +1012,34 @@ async def _invoke_lambda_target(func_name, tg_arn, method, path, headers, body, 
 async def dispatch_request(lb, method, path, headers, body, query_params, port=80):
     lb_arn = lb["LoadBalancerArn"]
 
+    # ── WAF evaluation ──
+    from ministack.services import waf, waf_engine
+    web_acl_arn = waf._associations.get(lb_arn)
+    waf_result = None
+    if web_acl_arn:
+        request_info = {
+            "client_ip": headers.get("x-forwarded-for", "127.0.0.1").split(",")[0].strip(),
+            "country": headers.get("x-waf-country", ""),
+            "method": method,
+            "uri": path,
+            "headers": dict(headers),
+            "query_string": "&".join(f"{k}={v[0]}" for k, v in query_params.items()) if query_params else "",
+            "body": body.decode("utf-8", errors="replace") if body else "",
+        }
+        waf_result = waf_engine.evaluate_request(web_acl_arn, request_info)
+
+        if waf_result.action == "BLOCK":
+            waf_engine.write_waf_log(web_acl_arn, request_info, waf_result)
+            resp_code = waf_result.custom_response_code or 403
+            return (resp_code, {"Content-Type": "text/html"},
+                    b"<html><body><h1>403 Forbidden</h1></body></html>")
+
+        # Apply InsertHeaders from COUNT/ALLOW actions to downstream request
+        if waf_result.inserted_headers:
+            headers = dict(headers)  # copy to avoid mutating original
+            for ih in waf_result.inserted_headers:
+                headers[ih["name"].lower()] = ih["value"]
+
     candidates = [l for l in _listeners.values() if l["LoadBalancerArn"] == lb_arn]
     matching = [l for l in candidates if l.get("Port", 80) == port] or candidates
 
@@ -1037,8 +1065,16 @@ async def dispatch_request(lb, method, path, headers, body, query_params, port=8
         if matched:
             actions = rule.get("Actions") or listener.get("DefaultActions", [])
             if actions:
-                return await _execute_action(actions[0], method, path,
+                resp = await _execute_action(actions[0], method, path,
                                              headers, body, query_params)
+                # Log ALLOW/COUNT WAF results after successful dispatch
+                if waf_result:
+                    waf_engine.write_waf_log(web_acl_arn, request_info, waf_result)
+                return resp
+
+    # Log WAF result even for unmatched ALB rules
+    if waf_result:
+        waf_engine.write_waf_log(web_acl_arn, request_info, waf_result)
 
     return (502, {"Content-Type": "application/json"},
             json.dumps({"message": "No matching ALB rule found"}).encode())

@@ -34,7 +34,7 @@ except ImportError:
 ACCOUNT_ID = "000000000000"
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
-from ministack.core.persistence import load_state, PERSIST_STATE
+from ministack.core.persistence import PERSIST_STATE, load_state
 
 _keys: dict = {}
 # key_id -> {
@@ -641,6 +641,184 @@ def _update_alias(data):
     return json_response({})
 
 
+# ---- Key Policy operations ----
+
+_DEFAULT_POLICY_TEMPLATE = json.dumps({
+    "Version": "2012-10-17",
+    "Id": "key-default-1",
+    "Statement": [{
+        "Sid": "Enable IAM User Permissions",
+        "Effect": "Allow",
+        "Principal": {"AWS": "arn:aws:iam::{account}:root"},
+        "Action": "kms:*",
+        "Resource": "*",
+    }],
+})
+
+_key_policies: dict = {}  # key_id -> {"default": policy_json_string}
+
+
+def _get_key_policy(data):
+    key_id = data.get("KeyId", "")
+    rec = _resolve_key(key_id)
+    if not rec:
+        return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+    policy_name = data.get("PolicyName", "default")
+    policies = _key_policies.get(rec["KeyId"], {})
+    policy = policies.get(policy_name)
+    if not policy:
+        # Return the default policy with the account ID filled in
+        policy = _DEFAULT_POLICY_TEMPLATE.replace("{account}", ACCOUNT_ID)
+    return json_response({"Policy": policy})
+
+
+def _put_key_policy(data):
+    key_id = data.get("KeyId", "")
+    rec = _resolve_key(key_id)
+    if not rec:
+        return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+    policy_name = data.get("PolicyName", "default")
+    policy = data.get("Policy", "")
+    if not policy:
+        return error_response_json("ValidationException", "Policy is required", 400)
+    if rec["KeyId"] not in _key_policies:
+        _key_policies[rec["KeyId"]] = {}
+    _key_policies[rec["KeyId"]][policy_name] = policy
+    return json_response({})
+
+
+def _list_key_policies(data):
+    key_id = data.get("KeyId", "")
+    rec = _resolve_key(key_id)
+    if not rec:
+        return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+    return json_response({"PolicyNames": ["default"], "Truncated": False})
+
+
+# ---- Key Rotation operations ----
+
+_key_rotation: dict = {}  # key_id -> bool
+
+
+def _get_key_rotation_status(data):
+    key_id = data.get("KeyId", "")
+    rec = _resolve_key(key_id)
+    if not rec:
+        return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+    enabled = _key_rotation.get(rec["KeyId"], False)
+    return json_response({"KeyRotationEnabled": enabled})
+
+
+def _enable_key_rotation(data):
+    key_id = data.get("KeyId", "")
+    rec = _resolve_key(key_id)
+    if not rec:
+        return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+    _key_rotation[rec["KeyId"]] = True
+    return json_response({})
+
+
+def _disable_key_rotation(data):
+    key_id = data.get("KeyId", "")
+    rec = _resolve_key(key_id)
+    if not rec:
+        return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+    _key_rotation[rec["KeyId"]] = False
+    return json_response({})
+
+
+# ---- Key lifecycle operations ----
+
+
+def _schedule_key_deletion(data):
+    key_id = data.get("KeyId", "")
+    rec = _resolve_key(key_id)
+    if not rec:
+        return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+    days = data.get("PendingWindowInDays", 30)
+    deletion_date = time.time() + (days * 86400)
+    kid = rec["KeyId"]
+    # In the emulator we remove the key immediately (no pending window)
+    _keys.pop(kid, None)
+    _key_policies.pop(kid, None)
+    _key_rotation.pop(kid, None)
+    # Remove any aliases pointing to this key
+    for alias_name in [a for a, k in _aliases.items() if k == kid]:
+        del _aliases[alias_name]
+    return json_response({
+        "KeyId": kid,
+        "DeletionDate": deletion_date,
+        "KeyState": "PendingDeletion",
+        "PendingWindowInDays": days,
+    })
+
+
+def _cancel_key_deletion(data):
+    key_id = data.get("KeyId", "")
+    rec = _resolve_key(key_id)
+    if not rec:
+        return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+    rec["KeyState"] = "Disabled"
+    rec.pop("DeletionDate", None)
+    return json_response({"KeyId": rec["KeyId"]})
+
+
+def _enable_key(data):
+    key_id = data.get("KeyId", "")
+    rec = _resolve_key(key_id)
+    if not rec:
+        return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+    rec["KeyState"] = "Enabled"
+    rec["Enabled"] = True
+    return json_response({})
+
+
+def _disable_key(data):
+    key_id = data.get("KeyId", "")
+    rec = _resolve_key(key_id)
+    if not rec:
+        return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+    rec["KeyState"] = "Disabled"
+    rec["Enabled"] = False
+    return json_response({})
+
+
+# ---- Tag operations ----
+
+
+def _tag_resource(data):
+    key_id = data.get("KeyId", "")
+    rec = _resolve_key(key_id)
+    if not rec:
+        return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+    tags = data.get("Tags", [])
+    existing = rec.get("Tags", [])
+    existing_map = {t["TagKey"]: t["TagValue"] for t in existing}
+    for t in tags:
+        existing_map[t["TagKey"]] = t["TagValue"]
+    rec["Tags"] = [{"TagKey": k, "TagValue": v} for k, v in existing_map.items()]
+    return json_response({})
+
+
+def _untag_resource(data):
+    key_id = data.get("KeyId", "")
+    rec = _resolve_key(key_id)
+    if not rec:
+        return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+    tag_keys = data.get("TagKeys", [])
+    existing = rec.get("Tags", [])
+    rec["Tags"] = [t for t in existing if t["TagKey"] not in tag_keys]
+    return json_response({})
+
+
+def _list_resource_tags(data):
+    key_id = data.get("KeyId", "")
+    rec = _resolve_key(key_id)
+    if not rec:
+        return error_response_json("NotFoundException", f"Key {key_id} not found", 400)
+    return json_response({"Tags": rec.get("Tags", []), "Truncated": False})
+
+
 # ---- Request handler ----
 
 async def handle_request(method, path, headers, body, query_params):
@@ -667,6 +845,19 @@ async def handle_request(method, path, headers, body, query_params):
         "DeleteAlias": _delete_alias,
         "ListAliases": _list_aliases,
         "UpdateAlias": _update_alias,
+        "GetKeyPolicy": _get_key_policy,
+        "PutKeyPolicy": _put_key_policy,
+        "ListKeyPolicies": _list_key_policies,
+        "GetKeyRotationStatus": _get_key_rotation_status,
+        "EnableKeyRotation": _enable_key_rotation,
+        "DisableKeyRotation": _disable_key_rotation,
+        "ScheduleKeyDeletion": _schedule_key_deletion,
+        "CancelKeyDeletion": _cancel_key_deletion,
+        "EnableKey": _enable_key,
+        "DisableKey": _disable_key,
+        "TagResource": _tag_resource,
+        "UntagResource": _untag_resource,
+        "ListResourceTags": _list_resource_tags,
     }
 
     handler = handlers.get(action)
@@ -681,3 +872,5 @@ async def handle_request(method, path, headers, body, query_params):
 def reset():
     _keys.clear()
     _aliases.clear()
+    _key_policies.clear()
+    _key_rotation.clear()

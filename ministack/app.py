@@ -76,6 +76,7 @@ from ministack.services import (
     ssm,
     stepfunctions,
     waf,
+    waf_engine,
 )
 from ministack.services.iam_sts import handle_iam_request, handle_sts_request
 
@@ -783,6 +784,7 @@ def _reset_all_state():
         (acm, acm.reset),
         (ses_v2, ses_v2.reset),
         (waf, waf.reset),
+        (waf_engine, waf_engine.reset),
         (efs, efs.reset),
         (cloudformation, cloudformation.reset),
         (kms, kms.reset),

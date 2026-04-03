@@ -10,8 +10,8 @@ Supports: CreateWebACL, GetWebACL, UpdateWebACL, DeleteWebACL, ListWebACLs,
 """
 
 import json
-import os
 import logging
+import os
 
 from ministack.core.responses import error_response_json, json_response, new_uuid, now_iso
 
@@ -20,11 +20,13 @@ logger = logging.getLogger("wafv2")
 ACCOUNT_ID = "000000000000"
 REGION = os.environ.get("MINISTACK_REGION", "us-east-1")
 
-_web_acls: dict = {}       # id -> webacl
-_ip_sets: dict = {}        # id -> ipset
-_rule_groups: dict = {}    # id -> rulegroup
-_associations: dict = {}   # resource_arn -> webacl_arn
-_waf_tags: dict = {}       # resource_arn -> [tags]
+_web_acls: dict = {}              # id -> webacl
+_ip_sets: dict = {}               # id -> ipset
+_rule_groups: dict = {}           # id -> rulegroup
+_regex_pattern_sets: dict = {}    # id -> regex pattern set
+_associations: dict = {}          # resource_arn -> webacl_arn
+_logging_configs: dict = {}       # web_acl_arn -> logging config
+_waf_tags: dict = {}              # resource_arn -> [tags]
 
 
 def _waf_err(code, message):
@@ -41,6 +43,10 @@ def _ipset_arn(name, uid):
 
 def _rg_arn(name, uid):
     return f"arn:aws:wafv2:{REGION}:{ACCOUNT_ID}:regional/rulegroup/{name}/{uid}"
+
+
+def _rps_arn(name, uid):
+    return f"arn:aws:wafv2:{REGION}:{ACCOUNT_ID}:regional/regexpatternset/{name}/{uid}"
 
 
 async def handle_request(method, path, headers, body, query_params):
@@ -75,6 +81,15 @@ async def handle_request(method, path, headers, body, query_params):
         "TagResource": _tag_resource,
         "UntagResource": _untag_resource,
         "ListTagsForResource": _list_tags_for_resource,
+        "CreateRegexPatternSet": _create_regex_pattern_set,
+        "GetRegexPatternSet": _get_regex_pattern_set,
+        "UpdateRegexPatternSet": _update_regex_pattern_set,
+        "DeleteRegexPatternSet": _delete_regex_pattern_set,
+        "ListRegexPatternSets": _list_regex_pattern_sets,
+        "PutLoggingConfiguration": _put_logging_configuration,
+        "GetLoggingConfiguration": _get_logging_configuration,
+        "DeleteLoggingConfiguration": _delete_logging_configuration,
+        "ListLoggingConfigurations": _list_logging_configurations,
         "CheckCapacity": _check_capacity,
         "DescribeManagedRuleGroup": _describe_managed_rule_group,
     }
@@ -339,6 +354,120 @@ def _list_tags_for_resource(data):
 
 
 # ---------------------------------------------------------------------------
+# RegexPatternSet
+# ---------------------------------------------------------------------------
+
+def _normalize_regex_list(raw):
+    """Normalize RegularExpressionList — accept both [{"RegexString": "x"}] and ["x"]."""
+    result = []
+    for item in (raw or []):
+        if isinstance(item, dict):
+            result.append(item)
+        else:
+            result.append({"RegexString": str(item)})
+    return result
+
+
+def _create_regex_pattern_set(data):
+    name = data.get("Name", "")
+    if not name:
+        return _waf_err("WAFInvalidParameterException", "Name is required")
+    uid = new_uuid()
+    lock_token = new_uuid()
+    arn = _rps_arn(name, uid)
+    _regex_pattern_sets[uid] = {
+        "ARN": arn, "Id": uid, "Name": name,
+        "Description": data.get("Description", ""),
+        "RegularExpressionList": _normalize_regex_list(data.get("RegularExpressionList", [])),
+        "LockToken": lock_token,
+        "Scope": data.get("Scope", "REGIONAL"),
+    }
+    _waf_tags[arn] = data.get("Tags", [])
+    return json_response({"Summary": {"ARN": arn, "Id": uid, "Name": name, "LockToken": lock_token}})
+
+
+def _get_regex_pattern_set(data):
+    uid = data.get("Id", "")
+    rps = _regex_pattern_sets.get(uid)
+    if not rps:
+        return _waf_err("WAFNonexistentItemException", f"RegexPatternSet {uid} not found")
+    rps_body = {k: v for k, v in rps.items() if k != "LockToken"}
+    return json_response({"RegexPatternSet": rps_body, "LockToken": rps["LockToken"]})
+
+
+def _update_regex_pattern_set(data):
+    uid = data.get("Id", "")
+    rps = _regex_pattern_sets.get(uid)
+    if not rps:
+        return _waf_err("WAFNonexistentItemException", f"RegexPatternSet {uid} not found")
+    if "RegularExpressionList" in data:
+        rps["RegularExpressionList"] = _normalize_regex_list(data["RegularExpressionList"])
+    rps["Description"] = data.get("Description", rps["Description"])
+    rps["LockToken"] = new_uuid()
+    return json_response({"NextLockToken": rps["LockToken"]})
+
+
+def _delete_regex_pattern_set(data):
+    uid = data.get("Id", "")
+    if uid not in _regex_pattern_sets:
+        return _waf_err("WAFNonexistentItemException", f"RegexPatternSet {uid} not found")
+    arn = _regex_pattern_sets[uid]["ARN"]
+    del _regex_pattern_sets[uid]
+    _waf_tags.pop(arn, None)
+    return json_response({})
+
+
+def _list_regex_pattern_sets(data):
+    scope = data.get("Scope", "REGIONAL")
+    sets = [
+        {"ARN": s["ARN"], "Id": s["Id"], "Name": s["Name"],
+         "Description": s.get("Description", ""), "LockToken": s["LockToken"]}
+        for s in _regex_pattern_sets.values() if s.get("Scope", "REGIONAL") == scope
+    ]
+    return json_response({"RegexPatternSets": sets, "NextMarker": None})
+
+
+# ---------------------------------------------------------------------------
+# LoggingConfiguration
+# ---------------------------------------------------------------------------
+
+def _put_logging_configuration(data):
+    config = data.get("LoggingConfiguration", {})
+    acl_arn = config.get("ResourceArn", "")
+    if not acl_arn:
+        return _waf_err("WAFInvalidParameterException", "ResourceArn is required")
+    _logging_configs[acl_arn] = {
+        "ResourceArn": acl_arn,
+        "LogDestinationConfigs": config.get("LogDestinationConfigs", []),
+        "RedactedFields": config.get("RedactedFields", []),
+        "ManagedByFirewallManager": False,
+        "LoggingFilter": config.get("LoggingFilter"),
+    }
+    return json_response({"LoggingConfiguration": _logging_configs[acl_arn]})
+
+
+def _get_logging_configuration(data):
+    acl_arn = data.get("ResourceArn", "")
+    config = _logging_configs.get(acl_arn)
+    if not config:
+        return _waf_err("WAFNonexistentItemException", f"No logging config for {acl_arn}")
+    return json_response({"LoggingConfiguration": config})
+
+
+def _delete_logging_configuration(data):
+    acl_arn = data.get("ResourceArn", "")
+    _logging_configs.pop(acl_arn, None)
+    return json_response({})
+
+
+def _list_logging_configurations(data):
+    configs = list(_logging_configs.values())
+    scope = data.get("Scope", "REGIONAL")
+    # Filter by scope if the ARN contains the matching pattern
+    return json_response({"LoggingConfigurations": configs, "NextMarker": None})
+
+
+# ---------------------------------------------------------------------------
 # Misc
 # ---------------------------------------------------------------------------
 
@@ -347,13 +476,23 @@ def _check_capacity(data):
 
 
 def _describe_managed_rule_group(data):
+    from ministack.services.waf_engine import _MANAGED_LABEL_NAMESPACE, _MANAGED_RULE_STUBS
+    group_name = data.get("Name", "")
+    vendor = data.get("VendorName", "AWS")
+
+    namespace = _MANAGED_LABEL_NAMESPACE.get(group_name, f"awswaf:managed:{vendor.lower()}:{group_name.lower()}")
+
+    stubs = _MANAGED_RULE_STUBS.get(group_name, {})
+    rules = [{"Name": rn, "Action": {"Block": {}}} for rn in stubs]
+    available_labels = [{"Name": f"{namespace}:{rn}"} for rn in stubs]
+
     return json_response({
         "VersionName": "Version_1.0",
         "SnsTopicArn": "",
         "Capacity": 700,
-        "Rules": [],
-        "LabelNamespace": f"awswaf:managed:{data.get('VendorName', 'AWS')}:{data.get('Name', '')}:",
-        "AvailableLabels": [],
+        "Rules": rules,
+        "LabelNamespace": f"{namespace}:",
+        "AvailableLabels": available_labels,
         "ConsumedLabels": [],
     })
 
@@ -362,5 +501,7 @@ def reset():
     _web_acls.clear()
     _ip_sets.clear()
     _rule_groups.clear()
+    _regex_pattern_sets.clear()
     _associations.clear()
+    _logging_configs.clear()
     _waf_tags.clear()

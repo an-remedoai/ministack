@@ -15785,6 +15785,964 @@ def test_waf_tags(wafv2):
     wafv2.untag_resource(ResourceARN=arn, TagKeys=["env"])
     tags_resp3 = wafv2.list_tags_for_resource(ResourceARN=arn)
     assert not any(t["Key"] == "env" for t in tags_resp3["TagInfoForResource"]["TagList"])
+
+
+# ---------------------------------------------------------------------------
+# WAF v2 — RegexPatternSet CRUD
+# ---------------------------------------------------------------------------
+
+def test_waf_regex_pattern_set_crud(wafv2):
+    resp = wafv2.create_regex_pattern_set(
+        Name="test-rps",
+        Scope="REGIONAL",
+        RegularExpressionList=[{"RegexString": r"\.php$"}, {"RegexString": r"\.env$"}],
+    )
+    uid = resp["Summary"]["Id"]
+    lock = resp["Summary"]["LockToken"]
+    assert resp["Summary"]["Name"] == "test-rps"
+
+    get_resp = wafv2.get_regex_pattern_set(Name="test-rps", Scope="REGIONAL", Id=uid)
+    raw = get_resp["RegexPatternSet"]["RegularExpressionList"]
+    patterns = [r["RegexString"] if isinstance(r, dict) else r for r in raw]
+    assert r"\.php$" in patterns
+    assert r"\.env$" in patterns
+
+    upd = wafv2.update_regex_pattern_set(
+        Name="test-rps", Scope="REGIONAL", Id=uid, LockToken=lock,
+        RegularExpressionList=[{"RegexString": r"wp-admin"}],
+    )
+    assert "NextLockToken" in upd
+
+    lst = wafv2.list_regex_pattern_sets(Scope="REGIONAL")
+    ids = [s["Id"] for s in lst["RegexPatternSets"]]
+    assert uid in ids
+
+    wafv2.delete_regex_pattern_set(Name="test-rps", Scope="REGIONAL", Id=uid, LockToken=upd["NextLockToken"])
+    lst2 = wafv2.list_regex_pattern_sets(Scope="REGIONAL")
+    ids2 = [s["Id"] for s in lst2["RegexPatternSets"]]
+    assert uid not in ids2
+
+
+# ---------------------------------------------------------------------------
+# WAF v2 — LoggingConfiguration CRUD
+# ---------------------------------------------------------------------------
+
+def test_waf_logging_configuration(wafv2):
+    acl_resp = wafv2.create_web_acl(
+        Name="log-acl", Scope="REGIONAL", DefaultAction={"Allow": {}},
+        VisibilityConfig={"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "m"},
+    )
+    acl_arn = acl_resp["Summary"]["ARN"]
+
+    wafv2.put_logging_configuration(LoggingConfiguration={
+        "ResourceArn": acl_arn,
+        "LogDestinationConfigs": ["arn:aws:s3:::waf-logs-bucket"],
+    })
+    get_resp = wafv2.get_logging_configuration(ResourceArn=acl_arn)
+    assert get_resp["LoggingConfiguration"]["ResourceArn"] == acl_arn
+    assert "arn:aws:s3:::waf-logs-bucket" in get_resp["LoggingConfiguration"]["LogDestinationConfigs"]
+
+    lst = wafv2.list_logging_configurations(Scope="REGIONAL")
+    assert any(c["ResourceArn"] == acl_arn for c in lst["LoggingConfigurations"])
+
+    wafv2.delete_logging_configuration(ResourceArn=acl_arn)
+    try:
+        wafv2.get_logging_configuration(ResourceArn=acl_arn)
+        assert False, "expected WAFNonexistentItemException"
+    except wafv2.exceptions.WAFNonexistentItemException:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# WAF v2 — Engine: IP Set blocking via ALB data-plane
+# ---------------------------------------------------------------------------
+
+def test_waf_engine_ip_block(wafv2, elbv2, s3):
+    """Create WebACL with IP blacklist → associate with ALB → blocked IP returns 403."""
+    # 1) Create S3 bucket for logs
+    s3.create_bucket(Bucket="waf-engine-logs")
+
+    # 2) Create IP set with a blocked IP
+    ip_resp = wafv2.create_ip_set(
+        Name="blacklist", Scope="REGIONAL", IPAddressVersion="IPV4",
+        Addresses=["10.0.0.99/32", "192.168.1.0/24"],
+    )
+    ipset_arn = ip_resp["Summary"]["ARN"]
+
+    # 3) Create WebACL with IP block rule
+    acl_resp = wafv2.create_web_acl(
+        Name="engine-test-acl", Scope="REGIONAL",
+        DefaultAction={"Allow": {}},
+        VisibilityConfig={"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "m"},
+        Rules=[{
+            "Name": "block-blacklisted-ips",
+            "Priority": 1,
+            "Action": {"Block": {}},
+            "Statement": {
+                "IPSetReferenceStatement": {"ARN": ipset_arn},
+            },
+            "VisibilityConfig": {"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "ip"},
+        }],
+    )
+    acl_arn = acl_resp["Summary"]["ARN"]
+
+    # 4) Set up logging
+    wafv2.put_logging_configuration(LoggingConfiguration={
+        "ResourceArn": acl_arn,
+        "LogDestinationConfigs": ["arn:aws:s3:::waf-engine-logs"],
+    })
+
+    # 5) Create ALB + listener with fixed response
+    lb_resp = elbv2.create_load_balancer(Name="waf-test-lb")
+    lb_arn = lb_resp["LoadBalancers"][0]["LoadBalancerArn"]
+    elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Port=80, Protocol="HTTP",
+        DefaultActions=[{"Type": "fixed-response", "FixedResponseConfig": {
+            "StatusCode": "200", "ContentType": "text/plain", "MessageBody": "OK"}}],
+    )
+
+    # 6) Associate WAF with ALB
+    wafv2.associate_web_acl(WebACLArn=acl_arn, ResourceArn=lb_arn)
+
+    # 7) Test: normal request → ALLOW (200)
+    import requests
+    resp_ok = requests.get("http://localhost:4566/_alb/waf-test-lb/api/test")
+    assert resp_ok.status_code == 200
+    assert resp_ok.text == "OK"
+
+    # 8) Test: blocked IP → BLOCK (403)
+    resp_blocked = requests.get(
+        "http://localhost:4566/_alb/waf-test-lb/api/test",
+        headers={"X-Forwarded-For": "10.0.0.99"},
+    )
+    assert resp_blocked.status_code == 403
+
+    # 9) Test: IP in blocked CIDR → BLOCK (403)
+    resp_cidr = requests.get(
+        "http://localhost:4566/_alb/waf-test-lb/api/test",
+        headers={"X-Forwarded-For": "192.168.1.50"},
+    )
+    assert resp_cidr.status_code == 403
+
+    # 10) Verify WAF logs exist in S3
+    objs = s3.list_objects_v2(Bucket="waf-engine-logs", Prefix="AWSLogs/")
+    assert objs.get("KeyCount", 0) > 0, "WAF logs should have been written to S3"
+
+    # Read one log and verify structure
+    key = objs["Contents"][0]["Key"]
+    log_body = s3.get_object(Bucket="waf-engine-logs", Key=key)["Body"].read()
+    log_entry = json.loads(log_body)
+    assert log_entry["formatVersion"] == 1
+    assert log_entry["webaclId"] == acl_arn
+    assert "httpRequest" in log_entry
+    assert log_entry["httpRequest"]["httpMethod"] == "GET"
+
+
+# ---------------------------------------------------------------------------
+# WAF v2 — Engine: Regex pattern set blocking
+# ---------------------------------------------------------------------------
+
+def test_waf_engine_regex_block(wafv2, elbv2):
+    """Create WebACL with regex pattern set → block .php and .env URIs."""
+    # Create regex pattern set
+    rps_resp = wafv2.create_regex_pattern_set(
+        Name="bad-urls", Scope="REGIONAL",
+        RegularExpressionList=[{"RegexString": r"\.(php|env)$"}, {"RegexString": r"wp-admin"}],
+    )
+    rps_arn = rps_resp["Summary"]["ARN"]
+
+    # Create WebACL
+    acl_resp = wafv2.create_web_acl(
+        Name="regex-test-acl", Scope="REGIONAL",
+        DefaultAction={"Allow": {}},
+        VisibilityConfig={"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "m"},
+        Rules=[{
+            "Name": "block-bad-urls",
+            "Priority": 1,
+            "Action": {"Block": {}},
+            "Statement": {
+                "RegexPatternSetReferenceStatement": {
+                    "ARN": rps_arn,
+                    "FieldToMatch": {"UriPath": {}},
+                    "TextTransformations": [{"Priority": 0, "Type": "LOWERCASE"}],
+                },
+            },
+            "VisibilityConfig": {"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "r"},
+        }],
+    )
+    acl_arn = acl_resp["Summary"]["ARN"]
+
+    # Create ALB
+    lb_resp = elbv2.create_load_balancer(Name="waf-regex-lb")
+    lb_arn = lb_resp["LoadBalancers"][0]["LoadBalancerArn"]
+    elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Port=80, Protocol="HTTP",
+        DefaultActions=[{"Type": "fixed-response", "FixedResponseConfig": {
+            "StatusCode": "200", "ContentType": "text/plain", "MessageBody": "OK"}}],
+    )
+    wafv2.associate_web_acl(WebACLArn=acl_arn, ResourceArn=lb_arn)
+
+    import requests
+    # Normal request → ALLOW
+    assert requests.get("http://localhost:4566/_alb/waf-regex-lb/api/v1/data").status_code == 200
+    # .php → BLOCK
+    assert requests.get("http://localhost:4566/_alb/waf-regex-lb/index.php").status_code == 403
+    # .env → BLOCK
+    assert requests.get("http://localhost:4566/_alb/waf-regex-lb/.env").status_code == 403
+    # wp-admin → BLOCK
+    assert requests.get("http://localhost:4566/_alb/waf-regex-lb/wp-admin/login").status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# WAF v2 — Engine: Byte match + size constraint
+# ---------------------------------------------------------------------------
+
+def test_waf_engine_byte_match(wafv2, elbv2):
+    """Byte match STARTS_WITH /admin → BLOCK."""
+    acl_resp = wafv2.create_web_acl(
+        Name="byte-test-acl", Scope="REGIONAL",
+        DefaultAction={"Allow": {}},
+        VisibilityConfig={"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "m"},
+        Rules=[{
+            "Name": "block-admin",
+            "Priority": 1,
+            "Action": {"Block": {}},
+            "Statement": {
+                "ByteMatchStatement": {
+                    "SearchString": "/admin",
+                    "FieldToMatch": {"UriPath": {}},
+                    "PositionalConstraint": "STARTS_WITH",
+                    "TextTransformations": [{"Priority": 0, "Type": "LOWERCASE"}],
+                },
+            },
+            "VisibilityConfig": {"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "b"},
+        }],
+    )
+    acl_arn = acl_resp["Summary"]["ARN"]
+
+    lb_resp = elbv2.create_load_balancer(Name="waf-byte-lb")
+    lb_arn = lb_resp["LoadBalancers"][0]["LoadBalancerArn"]
+    elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Port=80, Protocol="HTTP",
+        DefaultActions=[{"Type": "fixed-response", "FixedResponseConfig": {
+            "StatusCode": "200", "ContentType": "text/plain", "MessageBody": "OK"}}],
+    )
+    wafv2.associate_web_acl(WebACLArn=acl_arn, ResourceArn=lb_arn)
+
+    import requests
+    assert requests.get("http://localhost:4566/_alb/waf-byte-lb/api/data").status_code == 200
+    assert requests.get("http://localhost:4566/_alb/waf-byte-lb/admin/dashboard").status_code == 403
+    assert requests.get("http://localhost:4566/_alb/waf-byte-lb/Admin/Settings").status_code == 403  # LOWERCASE transform
+
+
+# ---------------------------------------------------------------------------
+# WAF v2 — Engine: Geo match
+# ---------------------------------------------------------------------------
+
+def test_waf_engine_geo_match(wafv2, elbv2):
+    """Block requests from specific countries using X-Waf-Country header."""
+    acl_resp = wafv2.create_web_acl(
+        Name="geo-test-acl", Scope="REGIONAL",
+        DefaultAction={"Allow": {}},
+        VisibilityConfig={"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "m"},
+        Rules=[{
+            "Name": "block-countries",
+            "Priority": 1,
+            "Action": {"Block": {}},
+            "Statement": {
+                "GeoMatchStatement": {"CountryCodes": ["CN", "RU"]},
+            },
+            "VisibilityConfig": {"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "g"},
+        }],
+    )
+    acl_arn = acl_resp["Summary"]["ARN"]
+
+    lb_resp = elbv2.create_load_balancer(Name="waf-geo-lb")
+    lb_arn = lb_resp["LoadBalancers"][0]["LoadBalancerArn"]
+    elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Port=80, Protocol="HTTP",
+        DefaultActions=[{"Type": "fixed-response", "FixedResponseConfig": {
+            "StatusCode": "200", "ContentType": "text/plain", "MessageBody": "OK"}}],
+    )
+    wafv2.associate_web_acl(WebACLArn=acl_arn, ResourceArn=lb_arn)
+
+    import requests
+    # BR → ALLOW
+    assert requests.get("http://localhost:4566/_alb/waf-geo-lb/", headers={"X-Waf-Country": "BR"}).status_code == 200
+    # CN → BLOCK
+    assert requests.get("http://localhost:4566/_alb/waf-geo-lb/", headers={"X-Waf-Country": "CN"}).status_code == 403
+    # RU → BLOCK
+    assert requests.get("http://localhost:4566/_alb/waf-geo-lb/", headers={"X-Waf-Country": "RU"}).status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# WAF v2 — Engine: AND/NOT combinators
+# ---------------------------------------------------------------------------
+
+def test_waf_engine_and_not_combinator(wafv2, elbv2):
+    """Block /login AND NOT from trusted IPs (whitelist pattern)."""
+    ip_resp = wafv2.create_ip_set(
+        Name="trusted-ips", Scope="REGIONAL", IPAddressVersion="IPV4",
+        Addresses=["10.10.10.0/24"],
+    )
+    trusted_arn = ip_resp["Summary"]["ARN"]
+
+    acl_resp = wafv2.create_web_acl(
+        Name="combo-test-acl", Scope="REGIONAL",
+        DefaultAction={"Allow": {}},
+        VisibilityConfig={"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "m"},
+        Rules=[{
+            "Name": "block-login-except-trusted",
+            "Priority": 1,
+            "Action": {"Block": {}},
+            "Statement": {
+                "AndStatement": {
+                    "Statements": [
+                        {"ByteMatchStatement": {
+                            "SearchString": "/login",
+                            "FieldToMatch": {"UriPath": {}},
+                            "PositionalConstraint": "STARTS_WITH",
+                            "TextTransformations": [{"Priority": 0, "Type": "NONE"}],
+                        }},
+                        {"NotStatement": {
+                            "Statement": {"IPSetReferenceStatement": {"ARN": trusted_arn}},
+                        }},
+                    ],
+                },
+            },
+            "VisibilityConfig": {"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "c"},
+        }],
+    )
+    acl_arn = acl_resp["Summary"]["ARN"]
+
+    lb_resp = elbv2.create_load_balancer(Name="waf-combo-lb")
+    lb_arn = lb_resp["LoadBalancers"][0]["LoadBalancerArn"]
+    elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Port=80, Protocol="HTTP",
+        DefaultActions=[{"Type": "fixed-response", "FixedResponseConfig": {
+            "StatusCode": "200", "ContentType": "text/plain", "MessageBody": "OK"}}],
+    )
+    wafv2.associate_web_acl(WebACLArn=acl_arn, ResourceArn=lb_arn)
+
+    import requests
+    # Non-login URL → ALLOW regardless of IP
+    assert requests.get("http://localhost:4566/_alb/waf-combo-lb/api/data").status_code == 200
+    # /login from untrusted IP → BLOCK
+    assert requests.get("http://localhost:4566/_alb/waf-combo-lb/login",
+                        headers={"X-Forwarded-For": "5.5.5.5"}).status_code == 403
+    # /login from trusted IP → ALLOW (NOT matches, AND fails)
+    assert requests.get("http://localhost:4566/_alb/waf-combo-lb/login",
+                        headers={"X-Forwarded-For": "10.10.10.5"}).status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# WAF v2 — Engine: Count action (non-terminating)
+# ---------------------------------------------------------------------------
+
+def test_waf_engine_count_action(wafv2, elbv2, s3):
+    """Rule with Count action should not block — request continues to ALB."""
+    s3.create_bucket(Bucket="waf-count-logs")
+
+    acl_resp = wafv2.create_web_acl(
+        Name="count-test-acl", Scope="REGIONAL",
+        DefaultAction={"Allow": {}},
+        VisibilityConfig={"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "m"},
+        Rules=[{
+            "Name": "count-admin",
+            "Priority": 1,
+            "Action": {"Count": {}},
+            "Statement": {
+                "ByteMatchStatement": {
+                    "SearchString": "/admin",
+                    "FieldToMatch": {"UriPath": {}},
+                    "PositionalConstraint": "STARTS_WITH",
+                    "TextTransformations": [{"Priority": 0, "Type": "NONE"}],
+                },
+            },
+            "VisibilityConfig": {"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "c"},
+        }],
+    )
+    acl_arn = acl_resp["Summary"]["ARN"]
+
+    wafv2.put_logging_configuration(LoggingConfiguration={
+        "ResourceArn": acl_arn,
+        "LogDestinationConfigs": ["arn:aws:s3:::waf-count-logs"],
+    })
+
+    lb_resp = elbv2.create_load_balancer(Name="waf-count-lb")
+    lb_arn = lb_resp["LoadBalancers"][0]["LoadBalancerArn"]
+    elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Port=80, Protocol="HTTP",
+        DefaultActions=[{"Type": "fixed-response", "FixedResponseConfig": {
+            "StatusCode": "200", "ContentType": "text/plain", "MessageBody": "OK"}}],
+    )
+    wafv2.associate_web_acl(WebACLArn=acl_arn, ResourceArn=lb_arn)
+
+    import requests
+    # /admin → COUNT (not blocked) → 200
+    resp = requests.get("http://localhost:4566/_alb/waf-count-lb/admin/dashboard")
+    assert resp.status_code == 200
+
+    # Verify log shows non-terminating rule
+    objs = s3.list_objects_v2(Bucket="waf-count-logs", Prefix="AWSLogs/")
+    assert objs.get("KeyCount", 0) > 0
+    key = objs["Contents"][0]["Key"]
+    log_body = s3.get_object(Bucket="waf-count-logs", Key=key)["Body"].read()
+    log_entry = json.loads(log_body)
+    assert log_entry["action"] == "ALLOW"
+    assert any(r["ruleId"] == "count-admin" for r in log_entry["nonTerminatingMatchingRules"])
+
+
+# ---------------------------------------------------------------------------
+# WAF v2 — Engine: Custom block response code
+# ---------------------------------------------------------------------------
+
+def test_waf_engine_custom_response_code(wafv2, elbv2):
+    """Block with custom response code 429."""
+    acl_resp = wafv2.create_web_acl(
+        Name="custom-resp-acl", Scope="REGIONAL",
+        DefaultAction={"Allow": {}},
+        VisibilityConfig={"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "m"},
+        Rules=[{
+            "Name": "rate-limit-sim",
+            "Priority": 1,
+            "Action": {"Block": {"CustomResponse": {"ResponseCode": 429}}},
+            "Statement": {
+                "ByteMatchStatement": {
+                    "SearchString": "/rate-test",
+                    "FieldToMatch": {"UriPath": {}},
+                    "PositionalConstraint": "STARTS_WITH",
+                    "TextTransformations": [{"Priority": 0, "Type": "NONE"}],
+                },
+            },
+            "VisibilityConfig": {"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "r"},
+        }],
+    )
+    acl_arn = acl_resp["Summary"]["ARN"]
+
+    lb_resp = elbv2.create_load_balancer(Name="waf-custom-lb")
+    lb_arn = lb_resp["LoadBalancers"][0]["LoadBalancerArn"]
+    elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Port=80, Protocol="HTTP",
+        DefaultActions=[{"Type": "fixed-response", "FixedResponseConfig": {
+            "StatusCode": "200", "ContentType": "text/plain", "MessageBody": "OK"}}],
+    )
+    wafv2.associate_web_acl(WebACLArn=acl_arn, ResourceArn=lb_arn)
+
+    import requests
+    resp = requests.get("http://localhost:4566/_alb/waf-custom-lb/rate-test")
+    assert resp.status_code == 429
+
+
+# ---------------------------------------------------------------------------
+# WAF v2 — Engine: Default Block action
+# ---------------------------------------------------------------------------
+
+def test_waf_engine_default_block(wafv2, elbv2):
+    """WebACL with DefaultAction=Block → all unmatched requests blocked."""
+    acl_resp = wafv2.create_web_acl(
+        Name="default-block-acl", Scope="REGIONAL",
+        DefaultAction={"Block": {}},
+        VisibilityConfig={"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "m"},
+        Rules=[{
+            "Name": "allow-api",
+            "Priority": 1,
+            "Action": {"Allow": {}},
+            "Statement": {
+                "ByteMatchStatement": {
+                    "SearchString": "/api/",
+                    "FieldToMatch": {"UriPath": {}},
+                    "PositionalConstraint": "STARTS_WITH",
+                    "TextTransformations": [{"Priority": 0, "Type": "NONE"}],
+                },
+            },
+            "VisibilityConfig": {"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "a"},
+        }],
+    )
+    acl_arn = acl_resp["Summary"]["ARN"]
+
+    lb_resp = elbv2.create_load_balancer(Name="waf-defblock-lb")
+    lb_arn = lb_resp["LoadBalancers"][0]["LoadBalancerArn"]
+    elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Port=80, Protocol="HTTP",
+        DefaultActions=[{"Type": "fixed-response", "FixedResponseConfig": {
+            "StatusCode": "200", "ContentType": "text/plain", "MessageBody": "OK"}}],
+    )
+    wafv2.associate_web_acl(WebACLArn=acl_arn, ResourceArn=lb_arn)
+
+    import requests
+    # /api/data → ALLOW by explicit rule
+    assert requests.get("http://localhost:4566/_alb/waf-defblock-lb/api/data").status_code == 200
+    # /other → BLOCK by default action
+    assert requests.get("http://localhost:4566/_alb/waf-defblock-lb/other").status_code == 403
+
+
+# ---------------------------------------------------------------------------
+# WAF v2 — Engine: WAF log format validation via Athena/DuckDB
+# ---------------------------------------------------------------------------
+
+def test_waf_logs_athena_query(wafv2, elbv2, s3, athena):
+    """Write WAF logs to S3 → query via Athena (DuckDB) → validate results."""
+    s3.create_bucket(Bucket="waf-athena-logs")
+
+    # Simple ACL that blocks /blocked
+    acl_resp = wafv2.create_web_acl(
+        Name="athena-test-acl", Scope="REGIONAL",
+        DefaultAction={"Allow": {}},
+        VisibilityConfig={"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "m"},
+        Rules=[{
+            "Name": "block-blocked-path",
+            "Priority": 1,
+            "Action": {"Block": {}},
+            "Statement": {
+                "ByteMatchStatement": {
+                    "SearchString": "/blocked",
+                    "FieldToMatch": {"UriPath": {}},
+                    "PositionalConstraint": "STARTS_WITH",
+                    "TextTransformations": [{"Priority": 0, "Type": "NONE"}],
+                },
+            },
+            "VisibilityConfig": {"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "b"},
+        }],
+    )
+    acl_arn = acl_resp["Summary"]["ARN"]
+
+    wafv2.put_logging_configuration(LoggingConfiguration={
+        "ResourceArn": acl_arn,
+        "LogDestinationConfigs": ["arn:aws:s3:::waf-athena-logs"],
+    })
+
+    lb_resp = elbv2.create_load_balancer(Name="waf-athena-lb")
+    lb_arn = lb_resp["LoadBalancers"][0]["LoadBalancerArn"]
+    elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Port=80, Protocol="HTTP",
+        DefaultActions=[{"Type": "fixed-response", "FixedResponseConfig": {
+            "StatusCode": "200", "ContentType": "text/plain", "MessageBody": "OK"}}],
+    )
+    wafv2.associate_web_acl(WebACLArn=acl_arn, ResourceArn=lb_arn)
+
+    import requests
+    # Generate some traffic
+    requests.get("http://localhost:4566/_alb/waf-athena-lb/api/ok")
+    requests.get("http://localhost:4566/_alb/waf-athena-lb/blocked/page")
+    requests.get("http://localhost:4566/_alb/waf-athena-lb/api/ok2")
+
+    # Query WAF logs via Athena (DuckDB)
+    query = "SELECT action, \"httpRequest\".uri FROM read_json_auto('s3://waf-athena-logs/AWSLogs/**/*.json') ORDER BY \"timestamp\""
+    exec_resp = athena.start_query_execution(
+        QueryString=query,
+        WorkGroup="primary",
+    )
+    qid = exec_resp["QueryExecutionId"]
+
+    # Wait for completion
+    import time
+    for _ in range(10):
+        status = athena.get_query_execution(QueryExecutionId=qid)
+        state = status["QueryExecution"]["Status"]["State"]
+        if state in ("SUCCEEDED", "FAILED"):
+            break
+        time.sleep(0.3)
+
+    assert state == "SUCCEEDED", f"Athena query failed: {status}"
+
+    results = athena.get_query_results(QueryExecutionId=qid)
+    rows = results["ResultSet"]["Rows"]
+    # Header + data rows
+    assert len(rows) >= 4  # 1 header + 3 data rows (ALLOW, BLOCK, ALLOW)
+
+    # Check we have at least one BLOCK and one ALLOW
+    actions = [r["Data"][0].get("VarCharValue", "") for r in rows[1:]]
+    assert "BLOCK" in actions
+    assert "ALLOW" in actions
+
+
+# ---------------------------------------------------------------------------
+# WAF v2 — Engine: Managed rule rule_action_override (Gap 2)
+# ---------------------------------------------------------------------------
+
+def test_waf_engine_managed_rule_override(wafv2, elbv2, s3):
+    """rule_action_override changes XSS from BLOCK to COUNT: label emitted, request not blocked."""
+    s3.create_bucket(Bucket="waf-override-logs")
+
+    acl_resp = wafv2.create_web_acl(
+        Name="override-test-acl", Scope="REGIONAL",
+        DefaultAction={"Allow": {}},
+        VisibilityConfig={"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "m"},
+        Rules=[{
+            "Name": "managed-common-override",
+            "Priority": 1,
+            "OverrideAction": {"None": {}},
+            "Statement": {
+                "ManagedRuleGroupStatement": {
+                    "VendorName": "AWS",
+                    "Name": "AWSManagedRulesCommonRuleSet",
+                    "RuleActionOverrides": [
+                        {"Name": "CrossSiteScripting_BODY", "ActionToUse": {"Count": {}}},
+                        {"Name": "CrossSiteScripting_QUERYARGUMENTS", "ActionToUse": {"Count": {}}},
+                        {"Name": "CrossSiteScripting_URIPATH", "ActionToUse": {"Count": {}}},
+                    ],
+                },
+            },
+            "VisibilityConfig": {"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "c"},
+        }],
+    )
+    acl_arn = acl_resp["Summary"]["ARN"]
+
+    wafv2.put_logging_configuration(LoggingConfiguration={
+        "ResourceArn": acl_arn,
+        "LogDestinationConfigs": ["arn:aws:s3:::waf-override-logs"],
+    })
+
+    lb_resp = elbv2.create_load_balancer(Name="waf-override-lb")
+    lb_arn = lb_resp["LoadBalancers"][0]["LoadBalancerArn"]
+    elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Port=80, Protocol="HTTP",
+        DefaultActions=[{"Type": "fixed-response", "FixedResponseConfig": {
+            "StatusCode": "200", "ContentType": "text/plain", "MessageBody": "OK"}}],
+    )
+    wafv2.associate_web_acl(WebACLArn=acl_arn, ResourceArn=lb_arn)
+
+    import requests
+    # XSS in body — sub-rule overridden to COUNT → request should pass (200)
+    resp = requests.post(
+        "http://localhost:4566/_alb/waf-override-lb/api/test",
+        data="<script>alert(1)</script>",
+        headers={"Content-Type": "text/plain", "User-Agent": "TestBot"},
+    )
+    assert resp.status_code == 200, f"Expected 200 (COUNT override), got {resp.status_code}"
+
+    # Verify labels in WAF logs
+    objs = s3.list_objects_v2(Bucket="waf-override-logs", Prefix="AWSLogs/")
+    assert objs.get("KeyCount", 0) > 0
+    key = objs["Contents"][-1]["Key"]
+    log_body = s3.get_object(Bucket="waf-override-logs", Key=key)["Body"].read()
+    log_entry = json.loads(log_body)
+    label_names = [l["name"] for l in log_entry.get("labels", [])]
+    assert any("CrossSiteScripting_BODY" in l for l in label_names), \
+        f"Expected XSS label in logs, got: {label_names}"
+
+
+# ---------------------------------------------------------------------------
+# WAF v2 — Engine: Label-based whitelist pattern (Gap 2 + label flow)
+# ---------------------------------------------------------------------------
+
+def test_waf_engine_label_whitelist_pattern(wafv2, elbv2):
+    """XSS on whitelisted path → ALLOW; XSS on non-whitelisted path → BLOCK via label match."""
+    # Create whitelist regex pattern set
+    rps_resp = wafv2.create_regex_pattern_set(
+        Name="xss-wl", Scope="REGIONAL",
+        RegularExpressionList=[{"RegexString": "/api/produtos"}, {"RegexString": "/api/conteudo"}],
+    )
+    rps_arn = rps_resp["Summary"]["ARN"]
+
+    acl_resp = wafv2.create_web_acl(
+        Name="label-wl-acl", Scope="REGIONAL",
+        DefaultAction={"Allow": {}},
+        VisibilityConfig={"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "m"},
+        Rules=[
+            # Rule 1: Managed Common with XSS→COUNT (emits labels)
+            {
+                "Name": "managed-common",
+                "Priority": 5,
+                "OverrideAction": {"None": {}},
+                "Statement": {
+                    "ManagedRuleGroupStatement": {
+                        "VendorName": "AWS",
+                        "Name": "AWSManagedRulesCommonRuleSet",
+                        "RuleActionOverrides": [
+                            {"Name": "CrossSiteScripting_BODY", "ActionToUse": {"Count": {}}},
+                        ],
+                    },
+                },
+                "VisibilityConfig": {"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "c"},
+            },
+            # Rule 2: Label whitelist — XSS label + NOT(whitelisted path) → BLOCK
+            {
+                "Name": "xss-label-block",
+                "Priority": 15,
+                "Action": {"Block": {}},
+                "Statement": {
+                    "AndStatement": {
+                        "Statements": [
+                            {"LabelMatchStatement": {
+                                "Scope": "LABEL",
+                                "Key": "awswaf:managed:aws:core-rule-set:CrossSiteScripting_BODY",
+                            }},
+                            {"NotStatement": {
+                                "Statement": {
+                                    "RegexPatternSetReferenceStatement": {
+                                        "ARN": rps_arn,
+                                        "FieldToMatch": {"UriPath": {}},
+                                        "TextTransformations": [{"Priority": 0, "Type": "NONE"}],
+                                    },
+                                },
+                            }},
+                        ],
+                    },
+                },
+                "VisibilityConfig": {"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "w"},
+            },
+        ],
+    )
+    acl_arn = acl_resp["Summary"]["ARN"]
+
+    lb_resp = elbv2.create_load_balancer(Name="waf-label-wl-lb")
+    lb_arn = lb_resp["LoadBalancers"][0]["LoadBalancerArn"]
+    elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Port=80, Protocol="HTTP",
+        DefaultActions=[{"Type": "fixed-response", "FixedResponseConfig": {
+            "StatusCode": "200", "ContentType": "text/plain", "MessageBody": "OK"}}],
+    )
+    wafv2.associate_web_acl(WebACLArn=acl_arn, ResourceArn=lb_arn)
+
+    import requests
+    # XSS on whitelisted path → ALLOW (200)
+    resp_wl = requests.post(
+        "http://localhost:4566/_alb/waf-label-wl-lb/api/produtos",
+        data="<script>alert(1)</script>",
+        headers={"Content-Type": "text/plain", "User-Agent": "TestBot"},
+    )
+    assert resp_wl.status_code == 200, f"Whitelisted path: expected 200, got {resp_wl.status_code}"
+
+    # XSS on non-whitelisted path → BLOCK (403)
+    resp_block = requests.post(
+        "http://localhost:4566/_alb/waf-label-wl-lb/unknown/path",
+        data="<script>alert(1)</script>",
+        headers={"Content-Type": "text/plain", "User-Agent": "TestBot"},
+    )
+    assert resp_block.status_code == 403, f"Non-whitelisted path: expected 403, got {resp_block.status_code}"
+
+
+# ---------------------------------------------------------------------------
+# WAF v2 — Engine: OverrideAction none vs count (Gap 3)
+# ---------------------------------------------------------------------------
+
+def test_waf_engine_override_action_none(wafv2, elbv2):
+    """override_action { none {} } + managed group BLOCK → request blocked."""
+    acl_resp = wafv2.create_web_acl(
+        Name="oa-none-acl", Scope="REGIONAL",
+        DefaultAction={"Allow": {}},
+        VisibilityConfig={"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "m"},
+        Rules=[{
+            "Name": "managed-linux-none",
+            "Priority": 1,
+            "OverrideAction": {"None": {}},
+            "Statement": {
+                "ManagedRuleGroupStatement": {
+                    "VendorName": "AWS",
+                    "Name": "AWSManagedRulesLinuxRuleSet",
+                },
+            },
+            "VisibilityConfig": {"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "l"},
+        }],
+    )
+    acl_arn = acl_resp["Summary"]["ARN"]
+
+    lb_resp = elbv2.create_load_balancer(Name="waf-oa-none-lb")
+    lb_arn = lb_resp["LoadBalancers"][0]["LoadBalancerArn"]
+    elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Port=80, Protocol="HTTP",
+        DefaultActions=[{"Type": "fixed-response", "FixedResponseConfig": {
+            "StatusCode": "200", "ContentType": "text/plain", "MessageBody": "OK"}}],
+    )
+    wafv2.associate_web_acl(WebACLArn=acl_arn, ResourceArn=lb_arn)
+
+    import requests
+    # LFI in URI → managed group matches → OverrideAction None → BLOCK
+    resp = requests.get("http://localhost:4566/_alb/waf-oa-none-lb/etc/passwd")
+    assert resp.status_code == 403, f"Expected 403 (OverrideAction None), got {resp.status_code}"
+
+    # Normal request → ALLOW
+    resp_ok = requests.get("http://localhost:4566/_alb/waf-oa-none-lb/api/ok")
+    assert resp_ok.status_code == 200
+
+
+def test_waf_engine_override_action_count(wafv2, elbv2, s3):
+    """override_action { count {} } + managed group BLOCK → request allowed, labels emitted."""
+    s3.create_bucket(Bucket="waf-oa-count-logs")
+
+    acl_resp = wafv2.create_web_acl(
+        Name="oa-count-acl", Scope="REGIONAL",
+        DefaultAction={"Allow": {}},
+        VisibilityConfig={"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "m"},
+        Rules=[{
+            "Name": "managed-linux-count",
+            "Priority": 1,
+            "OverrideAction": {"Count": {}},
+            "Statement": {
+                "ManagedRuleGroupStatement": {
+                    "VendorName": "AWS",
+                    "Name": "AWSManagedRulesLinuxRuleSet",
+                },
+            },
+            "VisibilityConfig": {"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "l"},
+        }],
+    )
+    acl_arn = acl_resp["Summary"]["ARN"]
+
+    wafv2.put_logging_configuration(LoggingConfiguration={
+        "ResourceArn": acl_arn,
+        "LogDestinationConfigs": ["arn:aws:s3:::waf-oa-count-logs"],
+    })
+
+    lb_resp = elbv2.create_load_balancer(Name="waf-oa-count-lb")
+    lb_arn = lb_resp["LoadBalancers"][0]["LoadBalancerArn"]
+    elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Port=80, Protocol="HTTP",
+        DefaultActions=[{"Type": "fixed-response", "FixedResponseConfig": {
+            "StatusCode": "200", "ContentType": "text/plain", "MessageBody": "OK"}}],
+    )
+    wafv2.associate_web_acl(WebACLArn=acl_arn, ResourceArn=lb_arn)
+
+    import requests
+    # LFI in URI → managed group matches → OverrideAction Count → ALLOW (200)
+    resp = requests.get("http://localhost:4566/_alb/waf-oa-count-lb/etc/passwd")
+    assert resp.status_code == 200, f"Expected 200 (OverrideAction Count), got {resp.status_code}"
+
+    # Check logs — labels should be emitted
+    objs = s3.list_objects_v2(Bucket="waf-oa-count-logs", Prefix="AWSLogs/")
+    assert objs.get("KeyCount", 0) > 0
+    key = objs["Contents"][-1]["Key"]
+    log_body = s3.get_object(Bucket="waf-oa-count-logs", Key=key)["Body"].read()
+    log_entry = json.loads(log_body)
+    label_names = [l["name"] for l in log_entry.get("labels", [])]
+    assert any("LFI_URIPATH" in l for l in label_names), \
+        f"Expected LFI label in logs, got: {label_names}"
+    # Non-terminating rule should be logged
+    nt_ids = [r["ruleId"] for r in log_entry.get("nonTerminatingMatchingRules", [])]
+    assert "managed-linux-count" in nt_ids
+
+
+# ---------------------------------------------------------------------------
+# WAF v2 — Engine: CUSTOM_KEYS rate limiting (Gap 4)
+# ---------------------------------------------------------------------------
+
+def test_waf_engine_custom_keys_rate(wafv2, elbv2):
+    """Rate limit by header CompanyToken; different tokens tracked separately."""
+    acl_resp = wafv2.create_web_acl(
+        Name="rate-custom-keys-acl", Scope="REGIONAL",
+        DefaultAction={"Allow": {}},
+        VisibilityConfig={"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "m"},
+        Rules=[{
+            "Name": "rate-by-token",
+            "Priority": 1,
+            "Action": {"Block": {"CustomResponse": {"ResponseCode": 429}}},
+            "Statement": {
+                "RateBasedStatement": {
+                    "Limit": 100,
+                    "AggregateKeyType": "CUSTOM_KEYS",
+                    "EvaluationWindowSec": 300,
+                    "CustomKeys": [
+                        {"Header": {
+                            "Name": "companytoken",
+                            "TextTransformations": [{"Priority": 0, "Type": "LOWERCASE"}],
+                        }},
+                    ],
+                },
+            },
+            "VisibilityConfig": {"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "r"},
+        }],
+    )
+    acl_arn = acl_resp["Summary"]["ARN"]
+
+    lb_resp = elbv2.create_load_balancer(Name="waf-rate-ck-lb")
+    lb_arn = lb_resp["LoadBalancers"][0]["LoadBalancerArn"]
+    elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Port=80, Protocol="HTTP",
+        DefaultActions=[{"Type": "fixed-response", "FixedResponseConfig": {
+            "StatusCode": "200", "ContentType": "text/plain", "MessageBody": "OK"}}],
+    )
+    wafv2.associate_web_acl(WebACLArn=acl_arn, ResourceArn=lb_arn)
+
+    import requests
+    # Send 102 requests with token "abc123" — first 100 pass, then blocked
+    for i in range(102):
+        resp = requests.get(
+            "http://localhost:4566/_alb/waf-rate-ck-lb/api/test",
+            headers={"CompanyToken": "abc123", "User-Agent": "TestBot"},
+        )
+    assert resp.status_code == 429, f"Token abc123: expected 429 after 100 reqs, got {resp.status_code}"
+
+    # Different token should NOT be rate-limited
+    resp_other = requests.get(
+        "http://localhost:4566/_alb/waf-rate-ck-lb/api/test",
+        headers={"CompanyToken": "xyz789", "User-Agent": "TestBot"},
+    )
+    assert resp_other.status_code == 200, f"Token xyz789: expected 200, got {resp_other.status_code}"
+
+
+# ---------------------------------------------------------------------------
+# WAF v2 — Engine: InsertHeader in COUNT action (Gap 5)
+# ---------------------------------------------------------------------------
+
+def test_waf_engine_insert_header(wafv2, elbv2, s3):
+    """COUNT with InsertHeader → header appears in WAF logs."""
+    s3.create_bucket(Bucket="waf-insert-hdr-logs")
+
+    acl_resp = wafv2.create_web_acl(
+        Name="insert-header-acl", Scope="REGIONAL",
+        DefaultAction={"Allow": {}},
+        VisibilityConfig={"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "m"},
+        Rules=[{
+            "Name": "count-with-header",
+            "Priority": 1,
+            "Action": {
+                "Count": {
+                    "CustomRequestHandling": {
+                        "InsertHeaders": [
+                            {"Name": "x-acesso-estrangeiro", "Value": "1"},
+                        ],
+                    },
+                },
+            },
+            "Statement": {
+                "NotStatement": {
+                    "Statement": {
+                        "GeoMatchStatement": {"CountryCodes": ["BR"]},
+                    },
+                },
+            },
+            "VisibilityConfig": {"SampledRequestsEnabled": False, "CloudWatchMetricsEnabled": False, "MetricName": "h"},
+        }],
+    )
+    acl_arn = acl_resp["Summary"]["ARN"]
+
+    wafv2.put_logging_configuration(LoggingConfiguration={
+        "ResourceArn": acl_arn,
+        "LogDestinationConfigs": ["arn:aws:s3:::waf-insert-hdr-logs"],
+    })
+
+    lb_resp = elbv2.create_load_balancer(Name="waf-insert-hdr-lb")
+    lb_arn = lb_resp["LoadBalancers"][0]["LoadBalancerArn"]
+    elbv2.create_listener(
+        LoadBalancerArn=lb_arn, Port=80, Protocol="HTTP",
+        DefaultActions=[{"Type": "fixed-response", "FixedResponseConfig": {
+            "StatusCode": "200", "ContentType": "text/plain", "MessageBody": "OK"}}],
+    )
+    wafv2.associate_web_acl(WebACLArn=acl_arn, ResourceArn=lb_arn)
+
+    import requests
+    # Foreign request (not BR) → COUNT with InsertHeader
+    resp = requests.get(
+        "http://localhost:4566/_alb/waf-insert-hdr-lb/api/test",
+        headers={"X-Waf-Country": "DE", "User-Agent": "TestBot"},
+    )
+    assert resp.status_code == 200, f"Expected 200 (COUNT), got {resp.status_code}"
+
+    # Verify InsertHeaders in WAF log
+    objs = s3.list_objects_v2(Bucket="waf-insert-hdr-logs", Prefix="AWSLogs/")
+    assert objs.get("KeyCount", 0) > 0
+    key = objs["Contents"][-1]["Key"]
+    log_body = s3.get_object(Bucket="waf-insert-hdr-logs", Key=key)["Body"].read()
+    log_entry = json.loads(log_body)
+    inserted = log_entry.get("requestHeadersInserted", [])
+    assert inserted is not None, "Expected requestHeadersInserted in log"
+    header_names = [h.get("name", "") for h in (inserted or [])]
+    assert "x-acesso-estrangeiro" in header_names, \
+        f"Expected x-acesso-estrangeiro in inserted headers, got: {inserted}"
+
+
 # ========== CloudFormation ==========
 
 
