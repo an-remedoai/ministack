@@ -173,7 +173,6 @@ pytest tests/ -v -k "cognito"
 - [ ] Linting passes (`ruff check ministack/`)
 - [ ] Service added to the table in `README.md`
 - [ ] Entry added to `CHANGELOG.md`
-- [ ] Version bumped in `pyproject.toml`
 
 ---
 
