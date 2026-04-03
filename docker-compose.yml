@@ -41,6 +41,20 @@ services:
       retries: 5
     restart: unless-stopped
 
+  # Optional: Dashboard for visual inspection of MiniStack state
+  # Uncomment to enable the web dashboard at localhost:3000
+  # dashboard:
+  #   build: ./dashboard
+  #   container_name: ministack-dashboard
+  #   ports:
+  #     - "3000:3000"
+  #   environment:
+  #     - MINISTACK_URL=http://ministack:4566
+  #   depends_on:
+  #     ministack:
+  #       condition: service_healthy
+  #   restart: unless-stopped
+
   # Optional: Postgres for RDS (always-on, no Docker-in-Docker needed)
   # Uncomment to have a persistent Postgres available at localhost:5432
   # postgres:

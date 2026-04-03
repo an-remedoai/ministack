@@ -46,6 +46,7 @@ from ministack.services import (
     apigateway_v1,
     athena,
     cloudformation,
+    cloudfront,
     cloudwatch,
     cloudwatch_logs,
     cognito,
@@ -54,11 +55,13 @@ from ministack.services import (
     ecr,
     ecs,
     efs,
+    eks,
     elasticache,
     emr,
     eventbridge,
     firehose,
     glue,
+    iam_sts,
     kinesis,
     kms,
     lambda_svc,
@@ -73,9 +76,7 @@ from ministack.services import (
     ssm,
     stepfunctions,
     waf,
-    cloudfront,
 )
-from ministack.services import iam_sts
 from ministack.services.iam_sts import handle_iam_request, handle_sts_request
 
 LOG_LEVEL = os.environ.get("LOG_LEVEL", "INFO").upper()
@@ -122,6 +123,7 @@ SERVICE_HANDLERS = {
     "elasticfilesystem": efs.handle_request,
     "kms": kms.handle_request,
     "cloudfront": cloudfront.handle_request,
+    "eks": eks.handle_request,
 }
 
 SERVICE_NAME_ALIASES = {
@@ -175,7 +177,7 @@ BANNER = r"""
  Services: S3, SQS, SNS, DynamoDB, Lambda, IAM, STS, SecretsManager, CloudWatch Logs,
           SSM, EventBridge, Kinesis, CloudWatch, SES, SES v2, ACM, WAF v2, Step Functions,
           ECS, RDS, ElastiCache, Glue, Athena, API Gateway, Firehose, Route53,
-          Cognito, EC2, EMR, EBS, EFS, ALB/ELBv2, CloudFormation, KMS, ECR, CloudFront
+          Cognito, EC2, EMR, EBS, EFS, ALB/ELBv2, CloudFormation, KMS, ECR, CloudFront, EKS
 """
 
 
@@ -358,6 +360,28 @@ async def app(scope, receive, send):
         }).encode())
         return
 
+    # ── State introspection endpoints ──
+    if path == "/_ministack/state" and method == "GET":
+        state_data = _get_all_state_summary()
+        await _send_response(send, 200, {
+            "Content-Type": "application/json",
+            "x-amzn-requestid": request_id,
+        }, json.dumps(state_data).encode())
+        return
+
+    if path.startswith("/_ministack/state/") and method == "GET":
+        svc_name = path[len("/_ministack/state/"):]
+        detail = _get_service_state_detail(svc_name)
+        if detail is None:
+            await _send_response(send, 404, {"Content-Type": "application/json"},
+                                 json.dumps({"error": f"Unknown service: {svc_name}"}).encode())
+            return
+        await _send_response(send, 200, {
+            "Content-Type": "application/json",
+            "x-amzn-requestid": request_id,
+        }, json.dumps(detail).encode())
+        return
+
     if method == "OPTIONS":
         await _send_response(send, 200, {
             "Access-Control-Allow-Origin": "*",
@@ -441,7 +465,7 @@ async def app(scope, receive, send):
         _non_s3_hosts = {"s3", "s3-control", "sqs", "sns", "dynamodb", "lambda", "iam", "sts",
                          "secretsmanager", "logs", "ssm", "events", "kinesis",
                          "monitoring", "ses", "states", "ecs", "rds", "elasticache",
-                         "glue", "athena", "apigateway", "cloudformation"}
+                         "glue", "athena", "apigateway", "cloudformation", "eks"}
         if bucket not in _non_s3_hosts:
             vhost_path = "/" + bucket + path if path != "/" else "/" + bucket + "/"
             try:
@@ -559,6 +583,7 @@ async def _handle_lifespan(scope, receive, send):
                     "rds": rds.get_state,
                     "ecs": ecs.get_state,
                     "elasticache": elasticache.get_state,
+                    "eks": eks.get_state,
                 })
             await send({"type": "lifespan.shutdown.complete"})
             return
@@ -605,6 +630,131 @@ def _run_init_scripts():
             logger.error("Failed to execute init script %s: %s", script_path, e)
 
 
+def _get_all_state_summary():
+    """Return a summary of all resources across all services."""
+    _STATE_EXTRACTORS = {
+        "s3": lambda: {"buckets": len(s3._buckets)},
+        "sqs": lambda: {"queues": len(sqs._queues)},
+        "sns": lambda: {"topics": len(sns._topics), "subscriptions": len(sns._subscriptions)},
+        "dynamodb": lambda: {"tables": len(dynamodb._tables)},
+        "lambda": lambda: {"functions": len(lambda_svc._functions), "layers": len(lambda_svc._layers)},
+        "iam": lambda: {"roles": len(iam_sts._roles), "users": len(iam_sts._users), "policies": len(iam_sts._policies)},
+        "sts": lambda: {},
+        "secretsmanager": lambda: {"secrets": len(secretsmanager._secrets)},
+        "logs": lambda: {"log_groups": len(cloudwatch_logs._log_groups)},
+        "ssm": lambda: {"parameters": len(ssm._params)},
+        "events": lambda: {"rules": len(eventbridge._rules)},
+        "kinesis": lambda: {"streams": len(kinesis._streams)},
+        "monitoring": lambda: {"alarms": len(cloudwatch._alarms)},
+        "ses": lambda: {"identities": len(ses._identities)},
+        "acm": lambda: {"certificates": len(acm._certificates)},
+        "wafv2": lambda: {"web_acls": len(waf._web_acls)},
+        "states": lambda: {"state_machines": len(stepfunctions._state_machines)},
+        "ecr": lambda: {"repositories": len(ecr._repositories)},
+        "ecs": lambda: {"clusters": len(ecs._clusters), "services": len(ecs._services), "task_definitions": len(ecs._task_defs)},
+        "rds": lambda: {"db_instances": len(rds._instances)},
+        "elasticache": lambda: {"clusters": len(elasticache._clusters)},
+        "glue": lambda: {"databases": len(glue._databases), "tables": len(glue._tables)},
+        "athena": lambda: {"work_groups": len(athena._work_groups)},
+        "apigateway": lambda: {"apis": len(apigateway._apis)},
+        "firehose": lambda: {"delivery_streams": len(firehose._streams)},
+        "route53": lambda: {"hosted_zones": len(route53._zones)},
+        "cognito-idp": lambda: {"user_pools": len(cognito._user_pools)},
+        "cognito-identity": lambda: {"identity_pools": len(cognito._identity_pools)},
+        "ec2": lambda: {"instances": len(ec2._instances), "vpcs": len(ec2._vpcs), "subnets": len(ec2._subnets), "security_groups": len(ec2._security_groups)},
+        "elasticmapreduce": lambda: {"clusters": len(emr._clusters)},
+        "elasticloadbalancing": lambda: {"load_balancers": len(alb._load_balancers), "target_groups": len(alb._target_groups)},
+        "elasticfilesystem": lambda: {"file_systems": len(efs._file_systems)},
+        "kms": lambda: {"keys": len(kms._keys)},
+        "cloudfront": lambda: {"distributions": len(cloudfront._distributions)},
+        "cloudformation": lambda: {"stacks": len(cloudformation._stacks)},
+        "eks": lambda: {"clusters": len(eks._clusters), "nodegroups": len(eks._nodegroups), "addons": len(eks._addons)},
+    }
+
+    services = {}
+    total_resources = 0
+    for svc_name in SERVICE_HANDLERS:
+        extractor = _STATE_EXTRACTORS.get(svc_name)
+        if extractor:
+            try:
+                resources = extractor()
+                count = sum(resources.values())
+                total_resources += count
+                services[svc_name] = {"status": "available", "resources": resources}
+            except Exception:
+                services[svc_name] = {"status": "available", "resources": {}}
+        else:
+            services[svc_name] = {"status": "available", "resources": {}}
+
+    return {
+        "services": services,
+        "totals": {"services": len(SERVICE_HANDLERS), "total_resources": total_resources},
+    }
+
+
+def _get_service_state_detail(svc_name):
+    """Return detailed state for a specific service."""
+    svc_name = SERVICE_NAME_ALIASES.get(svc_name, svc_name)
+    if svc_name not in SERVICE_HANDLERS:
+        return None
+
+    _DETAIL_EXTRACTORS = {
+        "s3": lambda: {"buckets": [{"name": n, "created": b.get("created", ""), "versioning": b.get("versioning", False)} for n, b in s3._buckets.items()]},
+        "sqs": lambda: {"queues": [{"url": url, "attributes": q.get("attributes", {})} for url, q in sqs._queues.items()]},
+        "sns": lambda: {"topics": [{"arn": arn} for arn in sns._topics.keys()], "subscriptions": [{"arn": s.get("SubscriptionArn", ""), "protocol": s.get("Protocol", ""), "endpoint": s.get("Endpoint", "")} for s in sns._subscriptions.values()]},
+        "dynamodb": lambda: {"tables": [{"name": n, "status": t.get("TableStatus", "ACTIVE"), "key_schema": t.get("KeySchema", [])} for n, t in dynamodb._tables.items()]},
+        "lambda": lambda: {"functions": [{"name": n, "runtime": f.get("Runtime", ""), "handler": f.get("Handler", "")} for n, f in lambda_svc._functions.items()], "layers": [{"name": n} for n in lambda_svc._layers.keys()]},
+        "ecs": lambda: {"clusters": [{"name": c.get("clusterName", ""), "status": c.get("status", "")} for c in ecs._clusters.values()], "task_definitions": list(ecs._task_defs.keys()), "services": [{"name": s.get("serviceName", ""), "status": s.get("status", "")} for s in ecs._services.values()]},
+        "eks": lambda: {"clusters": [{"name": c.get("name", ""), "version": c.get("version", ""), "status": c.get("status", ""), "endpoint": c.get("endpoint", "")} for c in eks._clusters.values()], "nodegroups": [{"name": ng.get("nodegroupName", ""), "cluster": ng.get("clusterName", ""), "status": ng.get("status", "")} for ng in eks._nodegroups.values()], "addons": [{"name": a.get("addonName", ""), "cluster": a.get("clusterName", ""), "status": a.get("status", "")} for a in eks._addons.values()]},
+        "ec2": lambda: {"instances": [{"id": i.get("InstanceId", ""), "state": i.get("State", {}).get("Name", "")} for i in ec2._instances.values()], "vpcs": [{"id": v.get("VpcId", "")} for v in ec2._vpcs.values()], "subnets": [{"id": s.get("SubnetId", "")} for s in ec2._subnets.values()]},
+        "rds": lambda: {"db_instances": [{"id": i.get("DBInstanceIdentifier", ""), "engine": i.get("Engine", ""), "status": i.get("DBInstanceStatus", "")} for i in rds._instances.values()]},
+        "route53": lambda: {"hosted_zones": [{"id": z.get("Id", ""), "name": z.get("Name", "")} for z in route53._zones.values()]},
+        "iam": lambda: {"roles": [{"name": r.get("RoleName", "")} for r in iam_sts._roles.values()], "users": [{"name": u.get("UserName", "")} for u in iam_sts._users.values()]},
+    }
+
+    extractor = _DETAIL_EXTRACTORS.get(svc_name)
+    if extractor:
+        try:
+            resources = extractor()
+            return {"service": svc_name, "resources": resources}
+        except Exception as e:
+            return {"service": svc_name, "resources": {}, "error": str(e)}
+
+    # Fallback: try get_state() if the service has it
+    _STATE_FNS = {
+        "apigateway": apigateway.get_state,
+        "sqs": sqs.get_state,
+        "sns": sns.get_state,
+        "ssm": ssm.get_state,
+        "secretsmanager": secretsmanager.get_state,
+        "iam": iam_sts.get_state,
+        "dynamodb": dynamodb.get_state,
+        "kms": kms.get_state,
+        "eventbridge": eventbridge.get_state,
+        "logs": cloudwatch_logs.get_state,
+        "kinesis": kinesis.get_state,
+        "ec2": ec2.get_state,
+        "route53": route53.get_state,
+        "cognito-idp": cognito.get_state,
+        "ecr": ecr.get_state,
+        "monitoring": cloudwatch.get_state,
+        "s3": s3.get_state,
+        "lambda": lambda_svc.get_state,
+        "rds": rds.get_state,
+        "ecs": ecs.get_state,
+        "elasticache": elasticache.get_state,
+        "eks": eks.get_state,
+    }
+    get_fn = _STATE_FNS.get(svc_name)
+    if get_fn:
+        try:
+            return {"service": svc_name, "resources": get_fn()}
+        except Exception as e:
+            return {"service": svc_name, "resources": {}, "error": str(e)}
+
+    return {"service": svc_name, "resources": {}}
+
+
 def _reset_all_state():
     """Wipe all in-memory state across every service module, and persisted files if enabled."""
 
@@ -638,6 +788,7 @@ def _reset_all_state():
         (kms, kms.reset),
         (cloudfront, cloudfront.reset),
         (ecr, ecr.reset),
+        (eks, eks.reset),
     ]:
         try:
             fn()
@@ -724,7 +875,7 @@ def main():
             f.write(str(proc.pid))
         print(f"MiniStack started in background (PID {proc.pid}) on port {port}.")
         print(f"  Logs: {log_file}")
-        print(f"  Stop: ministack --stop")
+        print("  Stop: ministack --stop")
         return
 
     # Foreground — write PID file and clean up on exit

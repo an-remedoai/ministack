@@ -42,6 +42,11 @@ htmlcov/
 # Docker
 data/
 
+# Dashboard (Next.js)
+dashboard/node_modules/
+dashboard/.next/
+dashboard/out/
+
 # Secrets / local config
 .env
 .env.local
@@ -50,3 +55,6 @@ data/
 
 # Logs
 *.log
+
+# Claude.md
+CLAUDE.md

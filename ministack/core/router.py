@@ -162,6 +162,11 @@ SERVICE_PATTERNS = {
         "host_patterns": [r"cloudfront\."],
         "credential_scope": "cloudfront",
     },
+    "eks": {
+        "host_patterns": [r"eks\."],
+        "path_patterns": [r"^/clusters"],
+        "credential_scope": "eks",
+    },
 }
 
 
@@ -213,6 +218,7 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
                 "cloudformation": "cloudformation",
                 "kms": "kms",
                 "cloudfront": "cloudfront",
+                "eks": "eks",
             }
             if svc_name in scope_map:
                 return scope_map[svc_name]
@@ -421,6 +427,13 @@ def detect_service(method: str, path: str, headers: dict, query_params: dict) ->
     if path_lower.startswith("/oauth2/token"):
         return "cognito-idp"
     if path_lower.startswith(("/clusters", "/taskdefinitions", "/tasks", "/services", "/stoptask")):
+        # Distinguish EKS from ECS: EKS uses /clusters/{name}/node-groups, /clusters/{name}/addons, etc.
+        # ECS sends X-Amz-Target header; pure REST /clusters with sub-paths is EKS when credential scope says so
+        # Check if credential scope explicitly says eks
+        if auth:
+            scope_match = re.search(r"Credential=[^/]+/[^/]+/[^/]+/([^/]+)/", auth)
+            if scope_match and scope_match.group(1) == "eks":
+                return "eks"
         return "ecs"
     # smithy-rpc-v2-cbor path: /service/ServiceName/operation/ActionName
     if "/service/" in path_lower and "/operation/" in path_lower:

@@ -17869,3 +17869,267 @@ def test_s3_eventbridge_notification_on_delete(s3, sqs, eb):
     assert body["source"] == "aws.s3"
     assert body["detail"]["bucket"]["name"] == bucket
     assert body["detail"]["object"]["key"] == "del-test.txt"
+
+
+# ═══════════════════════════════════════════════════════════
+#  EKS — Elastic Kubernetes Service
+# ═══════════════════════════════════════════════════════════
+
+class TestEKS:
+    """EKS cluster, nodegroup, addon, and Fargate profile CRUD tests."""
+
+    def test_create_cluster(self, eks):
+        resp = eks.create_cluster(
+            name="test-cluster",
+            version="1.31",
+            roleArn="arn:aws:iam::000000000000:role/eks-service-role",
+            resourcesVpcConfig={
+                "subnetIds": ["subnet-12345", "subnet-67890"],
+                "securityGroupIds": ["sg-12345"],
+            },
+            tags={"env": "test"},
+        )
+        cluster = resp["cluster"]
+        assert cluster["name"] == "test-cluster"
+        assert cluster["version"] == "1.31"
+        assert cluster["status"] == "ACTIVE"
+        assert "arn:aws:eks:" in cluster["arn"]
+        assert cluster["endpoint"].startswith("https://")
+        assert cluster["certificateAuthority"]["data"]
+        assert cluster["identity"]["oidc"]["issuer"].startswith("https://oidc.eks.")
+        assert cluster["tags"]["env"] == "test"
+
+    def test_create_cluster_duplicate(self, eks):
+        with pytest.raises(eks.exceptions.ResourceInUseException):
+            eks.create_cluster(
+                name="test-cluster",
+                roleArn="arn:aws:iam::000000000000:role/eks-service-role",
+                resourcesVpcConfig={"subnetIds": ["subnet-12345"]},
+            )
+
+    def test_describe_cluster(self, eks):
+        resp = eks.describe_cluster(name="test-cluster")
+        cluster = resp["cluster"]
+        assert cluster["name"] == "test-cluster"
+        assert cluster["status"] == "ACTIVE"
+
+    def test_describe_cluster_not_found(self, eks):
+        with pytest.raises(eks.exceptions.ResourceNotFoundException):
+            eks.describe_cluster(name="nonexistent")
+
+    def test_list_clusters(self, eks):
+        resp = eks.list_clusters()
+        assert "test-cluster" in resp["clusters"]
+
+    def test_create_nodegroup(self, eks):
+        resp = eks.create_nodegroup(
+            clusterName="test-cluster",
+            nodegroupName="test-ng",
+            nodeRole="arn:aws:iam::000000000000:role/eks-node-role",
+            subnets=["subnet-12345", "subnet-67890"],
+            scalingConfig={"minSize": 1, "maxSize": 3, "desiredSize": 2},
+            instanceTypes=["t3.medium"],
+            tags={"env": "test"},
+        )
+        ng = resp["nodegroup"]
+        assert ng["nodegroupName"] == "test-ng"
+        assert ng["clusterName"] == "test-cluster"
+        assert ng["status"] == "ACTIVE"
+        assert ng["scalingConfig"]["desiredSize"] == 2
+        assert ng["instanceTypes"] == ["t3.medium"]
+
+    def test_describe_nodegroup(self, eks):
+        resp = eks.describe_nodegroup(clusterName="test-cluster", nodegroupName="test-ng")
+        ng = resp["nodegroup"]
+        assert ng["nodegroupName"] == "test-ng"
+
+    def test_list_nodegroups(self, eks):
+        resp = eks.list_nodegroups(clusterName="test-cluster")
+        assert "test-ng" in resp["nodegroups"]
+
+    def test_update_nodegroup_config(self, eks):
+        resp = eks.update_nodegroup_config(
+            clusterName="test-cluster",
+            nodegroupName="test-ng",
+            scalingConfig={"minSize": 2, "maxSize": 5, "desiredSize": 3},
+        )
+        assert resp["update"]["status"] == "Successful"
+
+        # Verify the update took effect
+        ng = eks.describe_nodegroup(clusterName="test-cluster", nodegroupName="test-ng")["nodegroup"]
+        assert ng["scalingConfig"]["desiredSize"] == 3
+        assert ng["scalingConfig"]["maxSize"] == 5
+
+    def test_create_addon(self, eks):
+        resp = eks.create_addon(
+            clusterName="test-cluster",
+            addonName="vpc-cni",
+            addonVersion="v1.18.1-eksbuild.1",
+            tags={"component": "networking"},
+        )
+        addon = resp["addon"]
+        assert addon["addonName"] == "vpc-cni"
+        assert addon["status"] == "ACTIVE"
+        assert addon["clusterName"] == "test-cluster"
+
+    def test_describe_addon(self, eks):
+        resp = eks.describe_addon(clusterName="test-cluster", addonName="vpc-cni")
+        assert resp["addon"]["addonName"] == "vpc-cni"
+
+    def test_list_addons(self, eks):
+        resp = eks.list_addons(clusterName="test-cluster")
+        assert "vpc-cni" in resp["addons"]
+
+    def test_create_fargate_profile(self, eks):
+        resp = eks.create_fargate_profile(
+            clusterName="test-cluster",
+            fargateProfileName="test-fp",
+            podExecutionRoleArn="arn:aws:iam::000000000000:role/eks-fargate-role",
+            subnets=["subnet-12345"],
+            selectors=[{"namespace": "default"}],
+        )
+        fp = resp["fargateProfile"]
+        assert fp["fargateProfileName"] == "test-fp"
+        assert fp["status"] == "ACTIVE"
+        assert fp["selectors"] == [{"namespace": "default"}]
+
+    def test_describe_fargate_profile(self, eks):
+        resp = eks.describe_fargate_profile(clusterName="test-cluster", fargateProfileName="test-fp")
+        assert resp["fargateProfile"]["fargateProfileName"] == "test-fp"
+
+    def test_list_fargate_profiles(self, eks):
+        resp = eks.list_fargate_profiles(clusterName="test-cluster")
+        assert "test-fp" in resp["fargateProfileNames"]
+
+    def test_tag_resource(self, eks):
+        # Get cluster ARN
+        cluster = eks.describe_cluster(name="test-cluster")["cluster"]
+        arn = cluster["arn"]
+        eks.tag_resource(resourceArn=arn, tags={"team": "platform"})
+        tags = eks.list_tags_for_resource(resourceArn=arn)["tags"]
+        assert tags["team"] == "platform"
+        assert tags["env"] == "test"  # original tag still there
+
+    def test_untag_resource(self, eks):
+        cluster = eks.describe_cluster(name="test-cluster")["cluster"]
+        arn = cluster["arn"]
+        eks.untag_resource(resourceArn=arn, tagKeys=["team"])
+        tags = eks.list_tags_for_resource(resourceArn=arn)["tags"]
+        assert "team" not in tags
+        assert "env" in tags
+
+    def test_delete_addon(self, eks):
+        resp = eks.delete_addon(clusterName="test-cluster", addonName="vpc-cni")
+        assert resp["addon"]["status"] == "DELETING"
+        # Verify it's gone
+        with pytest.raises(eks.exceptions.ResourceNotFoundException):
+            eks.describe_addon(clusterName="test-cluster", addonName="vpc-cni")
+
+    def test_delete_fargate_profile(self, eks):
+        resp = eks.delete_fargate_profile(clusterName="test-cluster", fargateProfileName="test-fp")
+        assert resp["fargateProfile"]["status"] == "DELETING"
+        with pytest.raises(eks.exceptions.ResourceNotFoundException):
+            eks.describe_fargate_profile(clusterName="test-cluster", fargateProfileName="test-fp")
+
+    def test_delete_nodegroup(self, eks):
+        resp = eks.delete_nodegroup(clusterName="test-cluster", nodegroupName="test-ng")
+        assert resp["nodegroup"]["status"] == "DELETING"
+        with pytest.raises(eks.exceptions.ResourceNotFoundException):
+            eks.describe_nodegroup(clusterName="test-cluster", nodegroupName="test-ng")
+
+    def test_delete_cluster(self, eks):
+        resp = eks.delete_cluster(name="test-cluster")
+        assert resp["cluster"]["status"] == "DELETING"
+        with pytest.raises(eks.exceptions.ResourceNotFoundException):
+            eks.describe_cluster(name="test-cluster")
+
+    def test_delete_cluster_not_found(self, eks):
+        with pytest.raises(eks.exceptions.ResourceNotFoundException):
+            eks.delete_cluster(name="nonexistent")
+
+    def test_cluster_full_lifecycle(self, eks):
+        """Full create → describe → update → delete lifecycle."""
+        # Create
+        eks.create_cluster(
+            name="lifecycle-cluster",
+            version="1.31",
+            roleArn="arn:aws:iam::000000000000:role/eks-role",
+            resourcesVpcConfig={"subnetIds": ["subnet-aaa"]},
+        )
+        # Create nodegroup
+        eks.create_nodegroup(
+            clusterName="lifecycle-cluster",
+            nodegroupName="lifecycle-ng",
+            nodeRole="arn:aws:iam::000000000000:role/eks-node-role",
+            subnets=["subnet-aaa"],
+        )
+        # Create addon
+        eks.create_addon(
+            clusterName="lifecycle-cluster",
+            addonName="coredns",
+        )
+        # List everything
+        assert "lifecycle-ng" in eks.list_nodegroups(clusterName="lifecycle-cluster")["nodegroups"]
+        assert "coredns" in eks.list_addons(clusterName="lifecycle-cluster")["addons"]
+        # Cleanup — must delete sub-resources first
+        eks.delete_addon(clusterName="lifecycle-cluster", addonName="coredns")
+        eks.delete_nodegroup(clusterName="lifecycle-cluster", nodegroupName="lifecycle-ng")
+        eks.delete_cluster(name="lifecycle-cluster")
+
+
+# ═══════════════════════════════════════════════════════════
+#  State Introspection Endpoints
+# ═══════════════════════════════════════════════════════════
+
+class TestStateEndpoints:
+    """Tests for /_ministack/state endpoints."""
+
+    def test_state_summary(self):
+        import urllib.request
+        endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+        req = urllib.request.Request(f"{endpoint}/_ministack/state")
+        resp = urllib.request.urlopen(req, timeout=5)
+        data = json.loads(resp.read())
+        assert "services" in data
+        assert "totals" in data
+        assert data["totals"]["services"] > 0
+        # EKS should be in the list
+        assert "eks" in data["services"]
+
+    def test_state_service_detail(self):
+        import urllib.request
+        endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+        req = urllib.request.Request(f"{endpoint}/_ministack/state/s3")
+        resp = urllib.request.urlopen(req, timeout=5)
+        data = json.loads(resp.read())
+        assert data["service"] == "s3"
+        assert "resources" in data
+
+    def test_state_service_eks(self, eks):
+        import urllib.request
+        # Create a cluster to have something to show
+        eks.create_cluster(
+            name="state-test-cluster",
+            roleArn="arn:aws:iam::000000000000:role/eks-role",
+            resourcesVpcConfig={"subnetIds": ["subnet-111"]},
+        )
+        endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+        req = urllib.request.Request(f"{endpoint}/_ministack/state/eks")
+        resp = urllib.request.urlopen(req, timeout=5)
+        data = json.loads(resp.read())
+        assert data["service"] == "eks"
+        clusters = data["resources"]["clusters"]
+        assert any(c["name"] == "state-test-cluster" for c in clusters)
+
+        # Cleanup
+        eks.delete_cluster(name="state-test-cluster")
+
+    def test_state_unknown_service(self):
+        import urllib.request
+        endpoint = os.environ.get("MINISTACK_ENDPOINT", "http://localhost:4566")
+        req = urllib.request.Request(f"{endpoint}/_ministack/state/nonexistent")
+        try:
+            urllib.request.urlopen(req, timeout=5)
+            assert False, "Should have returned 404"
+        except urllib.error.HTTPError as e:
+            assert e.code == 404
